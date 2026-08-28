@@ -81,8 +81,11 @@ class LedgerService:
             existing_record = res.scalar_one_or_none()
 
             if existing_record:
-                # Return the previously processed journal entry instead of re-executing
-                entry_stmt = select(JournalEntry).where(JournalEntry.id == existing_record.journal_entry_id)
+                entry_stmt = (
+                    select(JournalEntry)
+                    .options(selectinload(JournalEntry.postings))
+                    .where(JournalEntry.id == existing_record.journal_entry_id)
+                )
                 entry_res = await session.execute(entry_stmt)
                 return entry_res.scalar_one()
 
@@ -104,7 +107,7 @@ class LedgerService:
                 idempotency_key=idempotency_key
             )
             session.add(journal_entry)
-            await session.flush()  # Flushes session to assign a UUID to journal_entry.id
+            await session.flush()
 
             # Insert Child Postings
             for posting_in in entry_in.postings:
@@ -130,8 +133,49 @@ class LedgerService:
         # Step 4: Retrieve and Return the Full Record
         final_stmt = (
             select(JournalEntry)
-            .options(selectinload(JournalEntry.postings))  # <--- Add this option
+            .options(selectinload(JournalEntry.postings))
             .where(JournalEntry.id == journal_entry.id)
         )
         final_res = await session.execute(final_stmt)
         return final_res.scalar_one()
+
+    @staticmethod
+    async def get_trial_balance(session: AsyncSession) -> dict:
+        """
+        Generates a system-wide Trial Balance report.
+        Aggregates all accounts, calculates their individual balances,
+        and verifies that total system debits equal total system credits.
+        """
+        acc_result = await session.execute(select(Account))
+        accounts = acc_result.scalars().all()
+
+        account_items = []
+        for acc in accounts:
+            balance = await LedgerService.get_account_balance(session, acc.id)
+            account_items.append({
+                "account_id": acc.id,
+                "name": acc.name,
+                "type": acc.type,
+                "balance": balance
+            })
+
+        total_debits_stmt = select(func.coalesce(func.sum(Posting.amount), Decimal("0.0000"))).where(
+            Posting.direction == PostingDirection.DEBIT.value
+        )
+        total_debits_res = await session.execute(total_debits_stmt)
+        total_system_debits = total_debits_res.scalar_one()
+
+        total_credits_stmt = select(func.coalesce(func.sum(Posting.amount), Decimal("0.0000"))).where(
+            Posting.direction == PostingDirection.CREDIT.value
+        )
+        total_credits_res = await session.execute(total_credits_stmt)
+        total_system_credits = total_credits_res.scalar_one()
+
+        is_balanced = (total_system_debits == total_system_credits)
+
+        return {
+            "accounts": account_items,
+            "total_system_debits": total_system_debits,
+            "total_system_credits": total_system_credits,
+            "is_balanced": is_balanced
+        }
