@@ -7,8 +7,6 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-# --- Enums ---
-
 class AccountType(str, Enum):
     ASSET = "ASSET"
     LIABILITY = "LIABILITY"
@@ -21,8 +19,6 @@ class PostingDirection(str, Enum):
     DEBIT = "DEBIT"
     CREDIT = "CREDIT"
 
-
-# --- Account Schemas ---
 
 class AccountBase(BaseModel):
     name: str = Field(..., min_length=1, max_length=100, example="Main Operating Checking")
@@ -41,8 +37,6 @@ class AccountResponse(AccountBase):
     model_config = ConfigDict(from_attributes=True)
 
 
-# --- Posting Schemas ---
-
 class PostingCreate(BaseModel):
     account_id: UUID
     amount: Decimal = Field(..., gt=0, decimal_places=4, example=100.00)
@@ -56,8 +50,6 @@ class PostingResponse(PostingCreate):
 
     model_config = ConfigDict(from_attributes=True)
 
-
-# --- Journal Entry Schemas ---
 
 class JournalEntryCreate(BaseModel):
     description: str = Field(..., min_length=1, max_length=255, example="Customer Deposit")
@@ -107,3 +99,17 @@ class JournalEntryResponse(BaseModel):
     postings: List[PostingResponse]
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class AccountTrialBalanceItem(BaseModel):
+    account_id: UUID
+    name: str
+    type: str
+    balance: Decimal
+
+
+class TrialBalanceResponse(BaseModel):
+    accounts: List[AccountTrialBalanceItem]
+    total_system_debits: Decimal
+    total_system_credits: Decimal
+    is_balanced: bool
