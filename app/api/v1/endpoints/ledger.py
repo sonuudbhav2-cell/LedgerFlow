@@ -11,6 +11,7 @@ from app.schemas.ledger import (
     AccountResponse,
     JournalEntryCreate,
     JournalEntryResponse,
+    TrialBalanceResponse,
 )
 from app.services.ledger import LedgerService
 
@@ -45,7 +46,11 @@ async def get_account_balance(
     """Fetches the dynamic double-entry balance for a given account UUID."""
     try:
         balance = await LedgerService.get_account_balance(db, account_id)
-        return {"account_id": account_id, "balance": balance}
+        return {
+            "account_id": account_id,
+            "balance": balance,
+            "currency": "USD"
+        }
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -76,4 +81,16 @@ async def create_journal_entry(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e)
         )
-    
+
+
+@router.get(
+    "/reports/trial-balance",
+    response_model=TrialBalanceResponse,
+    summary="Generate Trial Balance Report",
+    description="Aggregates all account balances and verifies system-wide DEBIT and CREDIT equality."
+)
+async def get_trial_balance(
+    db: AsyncSession = Depends(get_db)
+):
+    """Computes and returns the system trial balance report."""
+    return await LedgerService.get_trial_balance(db)
