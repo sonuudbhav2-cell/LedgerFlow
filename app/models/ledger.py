@@ -3,7 +3,7 @@ from sqlalchemy import Column, String, Numeric, DateTime, ForeignKey, CheckConst
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
-from app.db.base import Base
+from app.db.session import Base
 
 class Account(Base):
     __tablename__ = "accounts"
