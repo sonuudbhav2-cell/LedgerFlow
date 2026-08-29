@@ -4,6 +4,7 @@ from uuid import UUID
 from typing import List, Optional, Tuple, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
+from sqlalchemy.orm import selectinload
 from fastapi import HTTPException, status
 
 from app.models.ledger import Account, JournalEntry, Posting, IdempotencyRecord
@@ -30,7 +31,6 @@ class LedgerService:
         if not account:
             return None
 
-        # Calculate sum of debits
         debit_stmt = select(func.coalesce(func.sum(Posting.amount), 0)).where(
             Posting.account_id == account_id,
             Posting.direction == "DEBIT"
@@ -38,7 +38,6 @@ class LedgerService:
         debit_res = await self.db.execute(debit_stmt)
         debit_sum = debit_res.scalar() or Decimal("0")
 
-        # Calculate sum of credits
         credit_stmt = select(func.coalesce(func.sum(Posting.amount), 0)).where(
             Posting.account_id == account_id,
             Posting.direction == "CREDIT"
@@ -46,9 +45,6 @@ class LedgerService:
         credit_res = await self.db.execute(credit_stmt)
         credit_sum = credit_res.scalar() or Decimal("0")
 
-        # Balance rules based on standard accounting rules:
-        # ASSET / EXPENSE increase on DEBIT (+ Debit - Credit)
-        # LIABILITY / EQUITY / REVENUE increase on CREDIT (+ Credit - Debit)
         if account.type in ["ASSET", "EXPENSE"]:
             balance = debit_sum - credit_sum
         else:
@@ -59,20 +55,22 @@ class LedgerService:
     async def create_journal_entry(
         self, entry_in: JournalEntryCreate, idempotency_key: Optional[str] = None
     ) -> JournalEntry:
-        # Check idempotency record if key is provided
         if idempotency_key:
             stmt = select(IdempotencyRecord).where(IdempotencyRecord.key == idempotency_key)
             result = await self.db.execute(stmt)
             existing_record = result.scalar_one_or_none()
 
             if existing_record and existing_record.journal_entry_id:
-                entry_stmt = select(JournalEntry).where(JournalEntry.id == existing_record.journal_entry_id)
+                entry_stmt = (
+                    select(JournalEntry)
+                    .options(selectinload(JournalEntry.postings))
+                    .where(JournalEntry.id == existing_record.journal_entry_id)
+                )
                 entry_res = await self.db.execute(entry_stmt)
                 existing_entry = entry_res.scalar_one_or_none()
                 if existing_entry:
                     return existing_entry
 
-        # Verify all targeted accounts exist
         account_ids = [p.account_id for p in entry_in.postings]
         acc_stmt = select(Account.id).where(Account.id.in_(account_ids))
         acc_res = await self.db.execute(acc_stmt)
@@ -85,10 +83,9 @@ class LedgerService:
                 detail=f"Accounts not found: {[str(i) for i in missing_accounts]}"
             )
 
-        # Create JournalEntry and linked Postings
         journal_entry = JournalEntry(description=entry_in.description)
         self.db.add(journal_entry)
-        await self.db.flush()  # Generates journal_entry.id
+        await self.db.flush()
 
         postings = [
             Posting(
@@ -101,7 +98,6 @@ class LedgerService:
         ]
         self.db.add_all(postings)
 
-        # Save Idempotency record linked to entry
         if idempotency_key:
             idempotency_rec = IdempotencyRecord(
                 key=idempotency_key,
@@ -111,5 +107,12 @@ class LedgerService:
             self.db.add(idempotency_rec)
 
         await self.db.commit()
-        await self.db.refresh(journal_entry)
-        return journal_entry
+
+        # Eager load postings relationship before returning
+        entry_stmt = (
+            select(JournalEntry)
+            .options(selectinload(JournalEntry.postings))
+            .where(JournalEntry.id == journal_entry.id)
+        )
+        entry_res = await self.db.execute(entry_stmt)
+        return entry_res.scalar_one()
