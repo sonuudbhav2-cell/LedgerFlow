@@ -1,7 +1,7 @@
 from decimal import Decimal
 import json
 from uuid import UUID
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
@@ -71,8 +71,10 @@ class LedgerService:
                 if existing_entry:
                     return existing_entry
 
-        account_ids = [p.account_id for p in entry_in.postings]
-        acc_stmt = select(Account.id).where(Account.id.in_(account_ids))
+        account_ids = sorted(list(set([p.account_id for p in entry_in.postings])))
+        
+        # Acquire row-level lock (FOR UPDATE) in deterministically sorted order to prevent deadlocks
+        acc_stmt = select(Account.id).where(Account.id.in_(account_ids)).with_for_update()
         acc_res = await self.db.execute(acc_stmt)
         found_account_ids = set(acc_res.scalars().all())
 
@@ -108,7 +110,6 @@ class LedgerService:
 
         await self.db.commit()
 
-        # Eager load postings relationship before returning
         entry_stmt = (
             select(JournalEntry)
             .options(selectinload(JournalEntry.postings))
