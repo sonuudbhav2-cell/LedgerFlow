@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.v1.endpoints import ledger, reconciliation
+from app.api.v1.endpoints import ledger, reconciliation, reports
 
 app = FastAPI(
     title="LedgerFlow Core Ledger API",
@@ -20,6 +20,7 @@ app.add_middleware(
 
 app.include_router(ledger.router, prefix="/api/v1", tags=["Ledger"])
 app.include_router(reconciliation.router, prefix="/api/v1/reconciliation", tags=["Reconciliation"])
+app.include_router(reports.router, prefix="/api/v1/reports", tags=["Reports"])
 
 @app.get("/health")
 async def health_check():

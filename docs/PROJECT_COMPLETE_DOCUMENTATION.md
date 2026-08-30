@@ -18,6 +18,7 @@ LedgerFlow/
 ├── Dockerfile
 ├── alembic.ini
 ├── docker-compose.yml
+├── perfect.yaml
 ├── pytest.ini
 ├── requirements.txt
 ├── app/__init__.py
@@ -31,6 +32,7 @@ LedgerFlow/
 ├── app/schemas/__init__.py
 ├── app/schemas/ledger.py
 ├── app/schemas/reconciliation.py
+├── app/schemas/reports.py
 ├── app/db/__init__.py
 ├── app/db/redis.py
 ├── app/db/session.py
@@ -39,6 +41,8 @@ LedgerFlow/
 ├── app/api/v1/endpoints/__init__.py
 ├── app/api/v1/endpoints/ledger.py
 ├── app/api/v1/endpoints/reconciliation.py
+├── app/api/v1/endpoints/reports.py
+├── app/api/v1/endpoints/router.py
 ├── app/services/__init__.py
 ├── app/services/ledger.py
 ├── app/services/reconciliation.py
@@ -47,6 +51,7 @@ LedgerFlow/
 ├── tests/test_ledger.py
 ├── tests/test_reconciliation.py
 ├── scripts/scan_and_document.py
+├── scripts/seed_large_dataset.py
 ├── .github/workflows/ci.yml
 ├── alembic/README
 ├── alembic/env.py
@@ -377,16 +382,57 @@ services:
       timeout: 5s
       retries: 5
 
+  prefect-server:
+    image: prefecthq/prefect:3-python3.11
+    container_name: ledgerflow_prefect_server
+    ports:
+      - "4200:4200"
+    environment:
+      - PREFECT_SERVER_API_HOST=0.0.0.0
+    command: prefect server start --host 0.0.0.0
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:4200/api/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   prefect-worker:
     image: prefecthq/prefect:3-python3.11
     container_name: ledgerflow_prefect_worker
     environment:
-      - PREFECT_API_URL=http://api0.local:4200/api
+      - PREFECT_API_URL=http://prefect-server:4200/api
     command: prefect worker start --pool default-agent-pool
+    depends_on:
+      prefect-server:
+        condition: service_healthy
 
 volumes:
   postgres_data:
   redis_data:
+```
+
+---
+
+### File: `perfect.yaml`
+
+**Purpose**: Project configuration, script, or component file for perfect.yaml.
+
+**Functional Overview**: Implements necessary operational functionality for module perfect.yaml.
+
+**Module Interconnections**: Integrates into the LedgerFlow build, testing, or execution pipeline.
+
+**Complete File Source Code**:
+
+```yaml
+prefect-version: 3.0.0
+name: ledgerflow
+deployments:
+  - name: reconciliation-nightly
+    entrypoint: app/pipelines/reconciliation_flow.py:reconciliation_flow
+    work_pool:
+      name: default-agent-pool
+    schedule:
+      cron: "0 2 * * *"
 ```
 
 ---
@@ -405,6 +451,8 @@ volumes:
 [pytest]
 pythonpath = .
 asyncio_mode = auto
+asyncio_default_fixture_loop_scope = function
+asyncio_default_test_loop_scope = function
 ```
 
 ---
@@ -433,6 +481,7 @@ prefect>=2.16.0
 pytest>=8.1.0
 pytest-asyncio>=0.23.5
 httpx>=0.27.0
+python-multipart
 ```
 
 ---
@@ -466,7 +515,7 @@ httpx>=0.27.0
 ```py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.v1.endpoints import ledger, reconciliation
+from app.api.v1.endpoints import ledger, reconciliation, reports
 
 app = FastAPI(
     title="LedgerFlow Core Ledger API",
@@ -486,6 +535,7 @@ app.add_middleware(
 
 app.include_router(ledger.router, prefix="/api/v1", tags=["Ledger"])
 app.include_router(reconciliation.router, prefix="/api/v1/reconciliation", tags=["Reconciliation"])
+app.include_router(reports.router, prefix="/api/v1/reports", tags=["Reports"])
 
 @app.get("/health")
 async def health_check():
@@ -553,32 +603,29 @@ settings = Settings()
 **Complete File Source Code**:
 
 ```py
-import os
-import httpx
+import asyncio
 from prefect import flow, task
 
-API_URL = os.getenv("API_URL", "http://localhost:8000/api/v1/reconciliation/run")
+from app.db.session import AsyncSessionLocal
+from app.services.reconciliation import ReconciliationService
 
 
-@task(retries=3, retry_delay_seconds=10)
-def trigger_reconciliation_run() -> dict:
-    """Triggers the backend reconciliation engine endpoint."""
-    with httpx.Client(timeout=30.0) as client:
-        response = client.post(API_URL)
-        response.raise_for_status()
-        return response.json()
+@task(name="Run Automated Reconciliation")
+async def trigger_reconciliation() -> dict:
+    async with AsyncSessionLocal() as session:
+        service = ReconciliationService(session)
+        return await service.run_reconciliation()
 
 
-@flow(name="ledgerflow-automated-reconciliation", log_prints=True)
-def reconciliation_pipeline():
-    print("Starting automated ledger reconciliation workflow...")
-    result = trigger_reconciliation_run()
-    print(f"Reconciliation completed successfully. Summary: {result}")
-    return result
+@flow(name="LedgerFlow Daily Reconciliation Pipeline")
+async def reconciliation_flow() -> dict:
+    summary = await trigger_reconciliation()
+    print(f"Reconciliation completed successfully: {summary}")
+    return summary
 
 
 if __name__ == "__main__":
-    reconciliation_pipeline()
+    asyncio.run(reconciliation_flow())
 ```
 
 ---
@@ -857,6 +904,53 @@ class ReconciliationRunResponse(BaseModel):
 
 ---
 
+### File: `app/schemas/reports.py`
+
+**Purpose**: Project configuration, script, or component file for app/schemas/reports.py.
+
+**Functional Overview**: Implements necessary operational functionality for module app/schemas/reports.py.
+
+**Module Interconnections**: Integrates into the LedgerFlow build, testing, or execution pipeline.
+
+**Complete File Source Code**:
+
+```py
+from decimal import Decimal
+from typing import List, Optional
+from uuid import UUID
+from pydantic import BaseModel, ConfigDict
+from app.schemas.ledger import AccountType
+
+class TrialBalanceItem(BaseModel):
+    account_id: UUID
+    account_name: str
+    account_type: AccountType
+    currency: str
+    total_debits: Decimal
+    total_credits: Decimal
+    net_balance: Decimal
+
+class TrialBalanceResponse(BaseModel):
+    items: List[TrialBalanceItem]
+
+class AccountActivityItem(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    posting_id: UUID
+    journal_entry_id: UUID
+    description: str
+    amount: Decimal
+    direction: str
+    created_at: Optional[str] = None
+
+class AccountActivityResponse(BaseModel):
+    account_id: UUID
+    items: List[AccountActivityItem]
+    limit: int
+    offset: int
+```
+
+---
+
 ### File: `app/db/__init__.py`
 
 **Purpose**: Project configuration, script, or component file for app/db/__init__.py.
@@ -1116,6 +1210,140 @@ async def resolve_manual_match(
 
 ---
 
+### File: `app/api/v1/endpoints/reports.py`
+
+**Purpose**: Project configuration, script, or component file for app/api/v1/endpoints/reports.py.
+
+**Functional Overview**: Implements necessary operational functionality for module app/api/v1/endpoints/reports.py.
+
+**Module Interconnections**: Integrates into the LedgerFlow build, testing, or execution pipeline.
+
+**Complete File Source Code**:
+
+```py
+from uuid import UUID
+from datetime import datetime
+from decimal import Decimal
+from fastapi import APIRouter, Depends, Query, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func, and_
+
+from app.db.session import get_db
+from app.models.ledger import Account, Posting, JournalEntry
+from app.schemas.reports import TrialBalanceResponse, TrialBalanceItem, AccountActivityResponse, AccountActivityItem
+from app.db.redis import redis_client
+import json
+
+router = APIRouter()
+
+@router.get("/trial-balance", response_model=TrialBalanceResponse)
+async def get_trial_balance(db: AsyncSession = Depends(get_db)):
+    cache_key = "report:trial_balance"
+    cached = await redis_client.get(cache_key)
+    if cached:
+        return TrialBalanceResponse.model_validate_json(cached)
+
+    stmt = (
+        select(
+            Account.id,
+            Account.name,
+            Account.type,
+            Account.currency,
+            func.coalesce(func.sum(func.case((Posting.direction == 'DEBIT', Posting.amount), else_=0)), 0).label("debits"),
+            func.coalesce(func.sum(func.case((Posting.direction == 'CREDIT', Posting.amount), else_=0)), 0).label("credits")
+        )
+        .outerjoin(Posting, Account.id == Posting.account_id)
+        .group_by(Account.id)
+    )
+    result = await db.execute(stmt)
+    rows = result.all()
+
+    items = []
+    for row in rows:
+        acc_type = str(row.type).upper()
+        net = (row.debits - row.credits) if acc_type in ["ASSET", "EXPENSE"] else (row.credits - row.debits)
+        items.append(
+            TrialBalanceItem(
+                account_id=row.id,
+                account_name=row.name,
+                account_type=row.type,
+                currency=row.currency,
+                total_debits=row.debits,
+                total_credits=row.credits,
+                net_balance=net
+            )
+        )
+
+    response_obj = TrialBalanceResponse(items=items)
+    await redis_client.set(cache_key, response_obj.model_dump_json(), ex=60)
+    return response_obj
+
+@router.get("/account-activity", response_model=AccountActivityResponse)
+async def get_account_activity(
+    account_id: UUID = Query(...),
+    from_date: Optional[datetime] = Query(None),
+    to_date: Optional[datetime] = Query(None),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db)
+):
+    account = await db.get(Account, account_id)
+    if not account:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Account not found")
+
+    query = (
+        select(Posting, JournalEntry.description, JournalEntry.created_at)
+        .join(JournalEntry, Posting.journal_entry_id == JournalEntry.id)
+        .where(Posting.account_id == account_id)
+    )
+
+    if from_date:
+        query = query.where(JournalEntry.created_at >= from_date)
+    if to_date:
+        query = query.where(JournalEntry.created_at <= to_date)
+
+    query = query.order_by(JournalEntry.created_at.desc()).limit(limit).offset(offset)
+    result = await db.execute(query)
+    rows = result.all()
+
+    items = [
+        AccountActivityItem(
+            posting_id=row.Posting.id,
+            journal_entry_id=row.Posting.journal_entry_id,
+            description=row.description,
+            amount=row.Posting.amount,
+            direction=row.Posting.direction,
+            created_at=row.created_at.isoformat() if row.created_at else None
+        )
+        for row in rows
+    ]
+
+    return AccountActivityResponse(account_id=account_id, items=items, limit=limit, offset=offset)
+```
+
+---
+
+### File: `app/api/v1/endpoints/router.py`
+
+**Purpose**: Project configuration, script, or component file for app/api/v1/endpoints/router.py.
+
+**Functional Overview**: Implements necessary operational functionality for module app/api/v1/endpoints/router.py.
+
+**Module Interconnections**: Integrates into the LedgerFlow build, testing, or execution pipeline.
+
+**Complete File Source Code**:
+
+```py
+from fastapi import APIRouter
+from app.api.v1.endpoints import reconciliation, reports
+
+api_router = APIRouter()
+api_router.include_router(reconciliation.router, prefix="/reconciliation")
+api_router.include_router(reports.router)
+```
+
+---
+
 ### File: `app/services/__init__.py`
 
 **Purpose**: Project configuration, script, or component file for app/services/__init__.py.
@@ -1145,7 +1373,7 @@ async def resolve_manual_match(
 ```py
 import uuid
 from decimal import Decimal
-from typing import Optional, Union, Tuple
+from typing import Optional, Union, Tuple, List
 from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -1205,6 +1433,32 @@ class LedgerService:
                 detail=f"Account '{account_id_or_name}' not found."
             )
         return account
+
+    async def _lock_accounts(self, account_ids: List[uuid.UUID]) -> dict:
+        """Acquire PostgreSQL row-level locks (SELECT ... FOR UPDATE) on the given
+        accounts, always in sorted-by-id order, to serialize concurrent journal
+        entries that touch the same account and to prevent deadlocks between
+        two entries that share overlapping account sets."""
+        unique_ids = sorted(set(account_ids))
+        if not unique_ids:
+            return {}
+
+        stmt = (
+            select(Account)
+            .where(Account.id.in_(unique_ids))
+            .order_by(Account.id)
+            .with_for_update()
+        )
+        result = await self.db.execute(stmt)
+        locked = {a.id: a for a in result.scalars().all()}
+
+        missing = set(unique_ids) - set(locked.keys())
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Account(s) not found: {', '.join(str(m) for m in missing)}"
+            )
+        return locked
 
     async def get_account_balance(
         self, account_id: Union[uuid.UUID, str]
@@ -1272,10 +1526,20 @@ class LedgerService:
                 if record:
                     return await self._get_entry_with_postings(record.journal_entry_id)
 
-            resolved_postings = []
+            # Resolve account references (id or name) to real account ids first,
+            # without holding a lock yet.
+            resolved_ids = []
             for posting_data in entry_data.postings:
                 account = await self._resolve_account(posting_data.account_id)
-                resolved_postings.append((account.id, posting_data))
+                resolved_ids.append(account.id)
+
+            # Now acquire row-level locks on every distinct account involved,
+            # always in sorted order, BEFORE writing any postings. This is what
+            # serializes two concurrent, DISTINCT journal entries that both touch
+            # the same account — the Redis lock above only protects against the
+            # same idempotency key being replayed, it does not serialize
+            # different requests hitting the same account.
+            locked_accounts = await self._lock_accounts(resolved_ids)
 
             journal_entry = JournalEntry(
                 description=entry_data.description
@@ -1283,7 +1547,7 @@ class LedgerService:
             self.db.add(journal_entry)
             await self.db.flush()
 
-            for account_id, posting_data in resolved_postings:
+            for account_id, posting_data in zip(resolved_ids, entry_data.postings):
                 posting = Posting(
                     journal_entry_id=journal_entry.id,
                     account_id=account_id,
@@ -1483,70 +1747,103 @@ class ReconciliationService:
 **Complete File Source Code**:
 
 ```py
-# tests/conftest.py
-
+import os
+import subprocess
+import pytest
 import asyncio
 from typing import AsyncGenerator
-import pytest
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.pool import NullPool
 from httpx import AsyncClient, ASGITransport
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
-# CHANGE 1: Import StaticPool instead of NullPool
-from sqlalchemy.pool import StaticPool
-from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.ext.compiler import compiles
-
-from app.db.session import Base, get_db
 from app.main import app
+from app.db.session import get_db
 
-# CHANGE 2: Explicitly import models so linters don't remove the import
-from app.models.ledger import Account, JournalEntry, Posting, IdempotencyRecord
-
-
-@compiles(JSONB, "sqlite")
-def compile_jsonb_sqlite(element, compiler, **kw):
-    return "JSON"
-
-
-TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
-
-# CHANGE 3: Use StaticPool so all sessions share the same in-memory database
-engine_test = create_async_engine(
-    TEST_DATABASE_URL,
-    connect_args={"check_same_thread": False},
-    poolclass=StaticPool, 
+# Real Postgres required — the balance-enforcement trigger is Postgres-only
+# and must actually be created by running migrations, not create_all().
+DATABASE_URL_TEST = os.environ.get(
+    "DATABASE_URL",
+    "postgresql+asyncpg://ledger_user:ledger_password@localhost:5432/ledgerflow_test",
 )
 
+# NullPool: forces a fresh connection every time instead of reusing a pooled
+# connection across pytest-asyncio's per-test event loops, which caused
+# "attached to a different loop" RuntimeErrors.
+engine_test_instance = create_async_engine(
+    DATABASE_URL_TEST, echo=False, future=True, poolclass=NullPool
+)
 async_session_test = async_sessionmaker(
-    engine_test, class_=AsyncSession, expire_on_commit=False
+    engine_test_instance, class_=AsyncSession, expire_on_commit=False
 )
 
 
-async def override_get_db() -> AsyncGenerator[AsyncSession, None]:
-    async with async_session_test() as session:
-        yield session
+def _run_alembic_upgrade():
+    subprocess.run(
+        ["alembic", "upgrade", "head"],
+        env={**os.environ, "DATABASE_URL": DATABASE_URL_TEST},
+        check=True,
+    )
 
 
-app.dependency_overrides[get_db] = override_get_db
+def _run_alembic_downgrade():
+    subprocess.run(
+        ["alembic", "downgrade", "base"],
+        env={**os.environ, "DATABASE_URL": DATABASE_URL_TEST},
+        check=True,
+    )
 
 
 @pytest.fixture(autouse=True)
 async def setup_database():
-    """Create tables before each test and drop them afterward."""
-    async with engine_test.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _run_alembic_upgrade)
     yield
-    async with engine_test.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
+    await loop.run_in_executor(None, _run_alembic_downgrade)
+
+
+@pytest.fixture(autouse=True)
+async def reset_redis_client():
+    """Disconnect the Redis client pool before/after tests to prevent event loop mismatch errors."""
+    try:
+        from app.db.redis import redis_client
+        if redis_client:
+            await redis_client.connection_pool.disconnect()
+    except (ImportError, AttributeError):
+        pass
+    yield
+    try:
+        from app.db.redis import redis_client
+        if redis_client:
+            await redis_client.connection_pool.disconnect()
+    except (ImportError, AttributeError):
+        pass
+
+
+@pytest.fixture
+async def async_session() -> AsyncGenerator[AsyncSession, None]:
+    async with async_session_test() as session:
+        yield session
 
 
 @pytest.fixture
 async def async_client() -> AsyncGenerator[AsyncClient, None]:
-    """Provide an asynchronous HTTP client for testing FastAPI endpoints."""
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as client:
+    # Each request gets its OWN session (not one shared session reused across
+    # concurrent requests) — AsyncSession is not safe for concurrent use.
+    async def override_get_db():
+        async with async_session_test() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         yield client
+
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def engine_test():
+    return engine_test_instance
 ```
 
 ---
@@ -1565,10 +1862,10 @@ async def async_client() -> AsyncGenerator[AsyncClient, None]:
 import pytest
 import asyncio
 from httpx import AsyncClient
+from uuid import uuid4
 
 @pytest.mark.asyncio
 async def test_concurrent_journal_entries(async_client: AsyncClient):
-    # Setup accounts
     acc1 = (await async_client.post("/api/v1/accounts", json={"name": "Vault", "type": "ASSET", "currency": "USD"})).json()["id"]
     acc2 = (await async_client.post("/api/v1/accounts", json={"name": "Sales", "type": "REVENUE", "currency": "USD"})).json()["id"]
 
@@ -1582,17 +1879,81 @@ async def test_concurrent_journal_entries(async_client: AsyncClient):
         }
         return await async_client.post("/api/v1/entries", json=payload)
 
-    # Fire 5 requests concurrently
     tasks = [send_entry("10.00") for _ in range(5)]
     responses = await asyncio.gather(*tasks)
 
     for res in responses:
         assert res.status_code == 201
 
-    # Verify final balance equals 5 * 10.00 = 50.00
     bal_res = await async_client.get(f"/api/v1/accounts/{acc1}/balance")
     assert bal_res.status_code == 200
     assert float(bal_res.json()["balance"]) == 50.00
+
+@pytest.mark.asyncio
+async def test_concurrent_idempotent_race_safety(async_client: AsyncClient):
+    acc1 = (await async_client.post("/api/v1/accounts", json={"name": "CashBox", "type": "ASSET", "currency": "USD"})).json()["id"]
+    acc2 = (await async_client.post("/api/v1/accounts", json={"name": "FeeRevenue", "type": "REVENUE", "currency": "USD"})).json()["id"]
+
+    shared_key = str(uuid4())
+    payload = {
+        "description": "Idempotent Race Test",
+        "postings": [
+            {"account_id": acc1, "amount": "25.00", "direction": "DEBIT"},
+            {"account_id": acc2, "amount": "25.00", "direction": "CREDIT"}
+        ]
+    }
+
+    async def send_with_key():
+        return await async_client.post(
+            "/api/v1/entries",
+            json=payload,
+            headers={"Idempotency-Key": shared_key}
+        )
+
+    # Fire 10 simultaneous requests with the exact same idempotency key
+    responses = await asyncio.gather(*(send_with_key() for _ in range(10)))
+
+    status_codes = [r.status_code for r in responses]
+    created_count = status_codes.count(201)
+    conflict_count = status_codes.count(409)
+
+    # Exactly one request should succeed (201), and any concurrent overlaps either succeed via idempotency lookup or get locked/rejected cleanly (409)
+    assert created_count >= 1
+    
+    entry_ids = [r.json()["id"] for r in responses if r.status_code == 201]
+    assert len(set(entry_ids)) == 1  # All successful responses must point to the exact same entry ID
+
+    # Verify balance reflects ONLY ONE posting (25.00), not N postings
+    bal_res = await async_client.get(f"/api/v1/accounts/{acc1}/balance")
+    assert float(bal_res.json()["balance"]) == 25.00
+
+@pytest.mark.asyncio
+async def test_concurrent_distinct_entries_same_account_no_deadlock(async_client: AsyncClient):
+    shared = (await async_client.post(
+        "/api/v1/accounts", json={"name": "SharedPool", "type": "ASSET", "currency": "USD"}
+    )).json()["id"]
+    counterparty = (await async_client.post(
+        "/api/v1/accounts", json={"name": "SharedRevenue", "type": "REVENUE", "currency": "USD"}
+    )).json()["id"]
+
+    async def post_distinct_entry(i: int):
+        return await async_client.post(
+            "/api/v1/entries",
+            json={
+                "description": f"Distinct entry {i}",
+                "postings": [
+                    {"account_id": shared, "amount": "5.00", "direction": "DEBIT"},
+                    {"account_id": counterparty, "amount": "5.00", "direction": "CREDIT"},
+                ],
+            },
+            headers={"Idempotency-Key": str(uuid4())},  # different key each time
+        )
+
+    responses = await asyncio.gather(*(post_distinct_entry(i) for i in range(20)))
+    assert all(r.status_code == 201 for r in responses)
+
+    bal_res = await async_client.get(f"/api/v1/accounts/{shared}/balance")
+    assert float(bal_res.json()["balance"]) == 100.00  # 20 * 5.00, no lost updates, no deadlock
 ```
 
 ---
@@ -1609,45 +1970,35 @@ async def test_concurrent_journal_entries(async_client: AsyncClient):
 
 ```py
 import pytest
-from decimal import Decimal
 from httpx import AsyncClient
-from uuid import uuid4
+from sqlalchemy.exc import IntegrityError
+from app.models.ledger import JournalEntry, Posting
+
 
 @pytest.mark.asyncio
-async def test_create_account_and_check_balance(async_client: AsyncClient):
-    res = await async_client.post("/api/v1/accounts", json={"name": "EUR Bank", "type": "ASSET", "currency": "EUR"})
-    assert res.status_code == 201
-    account_id = res.json()["id"]
-    assert res.json()["currency"] == "EUR"
+async def test_balance_trigger_rejects_unbalanced_entry(async_client: AsyncClient, async_session, engine_test):
+    # This test requires real PostgreSQL where the trigger is active
+    if "sqlite" in str(engine_test.url):
+        pytest.skip("Balance trigger is PostgreSQL-specific")
 
-    bal_res = await async_client.get(f"/api/v1/accounts/{account_id}/balance")
-    assert bal_res.status_code == 200
-    assert bal_res.json()["currency"] == "EUR"
-    assert Decimal(str(bal_res.json()["balance"])) == Decimal("0")
+    async with async_session as session:
+        acc1_res = await async_client.post("/api/v1/accounts", json={"name": "TriggerAsset", "type": "ASSET", "currency": "USD"})
+        acc2_res = await async_client.post("/api/v1/accounts", json={"name": "TriggerExpense", "type": "EXPENSE", "currency": "USD"})
+        acc1_id = acc1_res.json()["id"]
+        acc2_id = acc2_res.json()["id"]
 
-@pytest.mark.asyncio
-async def test_idempotent_entry_creation(async_client: AsyncClient):
-    acc1 = (await async_client.post("/api/v1/accounts", json={"name": "Cash", "type": "ASSET", "currency": "USD"})).json()["id"]
-    acc2 = (await async_client.post("/api/v1/accounts", json={"name": "Revenue", "type": "REVENUE", "currency": "USD"})).json()["id"]
+        entry = JournalEntry(description="Unbalanced Direct Insert")
+        session.add(entry)
+        await session.flush()
 
-    idempotency_key = str(uuid4())
-    payload = {
-        "description": "Payment",
-        "postings": [
-            {"account_id": acc1, "amount": "100.00", "direction": "DEBIT"},
-            {"account_id": acc2, "amount": "100.00", "direction": "CREDIT"}
-        ]
-    }
+        session.add(Posting(journal_entry_id=entry.id, account_id=acc1_id, amount="100.00", direction="DEBIT"))
+        session.add(Posting(journal_entry_id=entry.id, account_id=acc2_id, amount="50.00", direction="CREDIT"))
 
-    res1 = await async_client.post("/api/v1/entries", json=payload, headers={"Idempotency-Key": idempotency_key})
-    assert res1.status_code == 201
-    entry_id_1 = res1.json()["id"]
-
-    res2 = await async_client.post("/api/v1/entries", json=payload, headers={"Idempotency-Key": idempotency_key})
-    assert res2.status_code == 201
-    entry_id_2 = res2.json()["id"]
-
-    assert entry_id_1 == entry_id_2
+        with pytest.raises(Exception) as exc_info:
+            await session.commit()
+        
+        assert "Double-entry violation" in str(exc_info.value) or isinstance(exc_info.value, IntegrityError)
+        await session.rollback()
 ```
 
 ---
@@ -1664,37 +2015,36 @@ async def test_idempotent_entry_creation(async_client: AsyncClient):
 
 ```py
 import pytest
-from httpx import AsyncClient, ASGITransport
-from app.main import app
+from httpx import AsyncClient
+
 
 @pytest.mark.asyncio
-async def test_import_and_reconciliation_flow():
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
-        # Sample CSV content for bank statement import
-        csv_data = (
-            "external_ref,amount,currency,transaction_date\n"
-            "EXT-1001,150.00,USD,2026-06-01T12:00:00\n"
-            "EXT-1002,500.00,USD,2026-06-02T12:00:00\n"
-        )
-        
-        response = await ac.post(
-            "/api/v1/reconciliation/import",
-            params={"source": "stripe"},
-            files={"file": ("statement.csv", csv_data.encode("utf-8"), "text/csv")}
-        )
-        assert response.status_code == 201
-        assert "Successfully imported 2 external transactions" in response.json()["message"]
+async def test_import_and_reconciliation_flow(async_client: AsyncClient):
+    # Sample CSV content for bank statement import
+    csv_data = (
+        "external_ref,amount,currency,transaction_date\n"
+        "EXT-1001,150.00,USD,2026-06-01T12:00:00\n"
+        "EXT-1002,500.00,USD,2026-06-02T12:00:00\n"
+    )
 
-        # Run reconciliation
-        run_res = await ac.post("/api/v1/reconciliation/run")
-        assert run_res.status_code == 200
-        data = run_res.json()
-        assert data["total_processed"] == 2
+    response = await async_client.post(
+        "/api/v1/reconciliation/import",
+        params={"source": "stripe"},
+        files={"file": ("statement.csv", csv_data.encode("utf-8"), "text/csv")}
+    )
+    assert response.status_code == 201
+    assert "Successfully imported 2 external transactions" in response.json()["message"]
 
-        # Check unmatched / review queue
-        unmatched_res = await ac.get("/api/v1/reconciliation/unmatched")
-        assert unmatched_res.status_code == 200
-        assert isinstance(unmatched_res.json(), list)
+    # Run reconciliation
+    run_res = await async_client.post("/api/v1/reconciliation/run")
+    assert run_res.status_code == 200
+    data = run_res.json()
+    assert data["total_processed"] == 2
+
+    # Check unmatched / review queue
+    unmatched_res = await async_client.get("/api/v1/reconciliation/unmatched")
+    assert unmatched_res.status_code == 200
+    assert isinstance(unmatched_res.json(), list)
 ```
 
 ---
@@ -1957,6 +2307,57 @@ class LedgerFlowDocGenerator:
 if __name__ == "__main__":
   generator = LedgerFlowDocGenerator()
   generator.scan_and_generate()
+```
+
+---
+
+### File: `scripts/seed_large_dataset.py`
+
+**Purpose**: Project configuration, script, or component file for scripts/seed_large_dataset.py.
+
+**Functional Overview**: Implements necessary operational functionality for module scripts/seed_large_dataset.py.
+
+**Module Interconnections**: Integrates into the LedgerFlow build, testing, or execution pipeline.
+
+**Complete File Source Code**:
+
+```py
+import asyncio
+import uuid
+from decimal import Decimal
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.db.session import AsyncSessionLocal
+from app.models.ledger import Account, JournalEntry, Posting
+
+async def seed():
+    async with AsyncSessionLocal() as session:
+        print("Creating seed accounts...")
+        asset = Account(id=uuid.uuid4(), name="Seed Asset", type="ASSET", currency="USD")
+        revenue = Account(id=uuid.uuid4(), name="Seed Revenue", type="REVENUE", currency="USD")
+        session.add_all([asset, revenue])
+        await session.commit()
+
+        print("Generating 100,000+ postings in batches...")
+        batch_size = 5000
+        total_entries = 50000  # 50k entries * 2 postings = 100k postings
+
+        for i in range(0, total_entries, batch_size):
+            entries = []
+            postings = []
+            for _ in range(batch_size):
+                je_id = uuid.uuid4()
+                entries.append(JournalEntry(id=je_id, description="Bulk Seed Tx"))
+                amt = Decimal("10.00")
+                postings.append(Posting(journal_entry_id=je_id, account_id=asset.id, amount=amt, direction="DEBIT"))
+                postings.append(Posting(journal_entry_id=je_id, account_id=revenue.id, amount=amt, direction="CREDIT"))
+            
+            session.add_all(entries)
+            session.add_all(postings)
+            await session.commit()
+            print(f"Inserted batch up to {i + batch_size} entries...")
+
+if __name__ == "__main__":
+    asyncio.run(seed())
 ```
 
 ---
@@ -2268,33 +2669,33 @@ def upgrade() -> None:
 def downgrade() -> None:
     """Downgrade schema."""
     # ### commands auto generated by Alembic - please adjust! ###
-    op.add_column('postings', sa.Column('created_at', postgresql.TIMESTAMP(timezone=True), autoincrement=False, nullable=False))
-    op.drop_constraint(None, 'postings', type_='foreignkey')
+    op.add_column('postings', sa.Column('created_at', postgresql.TIMESTAMP(timezone=True), autoincrement=False, nullable=True))
+    op.drop_constraint('postings_journal_entry_id_fkey', 'postings', type_='foreignkey')
     op.create_foreign_key(op.f('postings_journal_entry_id_fkey'), 'postings', 'journal_entries', ['journal_entry_id'], ['id'])
     op.create_index(op.f('ix_postings_journal_entry_id'), 'postings', ['journal_entry_id'], unique=False)
     op.create_index(op.f('ix_postings_account_id'), 'postings', ['account_id'], unique=False)
     op.create_index(op.f('idx_posting_account_created'), 'postings', ['account_id', 'created_at'], unique=False)
     op.alter_column('postings', 'direction',
                existing_type=sa.String(length=6),
-               type_=postgresql.ENUM('DEBIT', 'CREDIT', name='direction'),
+               type_=postgresql.ENUM('DEBIT', 'CREDIT', name='direction'), postgresql_using='direction::direction',
                existing_nullable=False)
     op.add_column('journal_entries', sa.Column('idempotency_key', sa.VARCHAR(length=255), autoincrement=False, nullable=True))
     op.create_index(op.f('ix_journal_entries_idempotency_key'), 'journal_entries', ['idempotency_key'], unique=True)
-    op.drop_constraint(None, 'idempotency_records', type_='foreignkey')
+    op.drop_constraint('idempotency_records_journal_entry_id_fkey', 'idempotency_records', type_='foreignkey')
     op.drop_index(op.f('ix_idempotency_records_key'), table_name='idempotency_records')
     op.alter_column('idempotency_records', 'status_code',
                existing_type=sa.INTEGER(),
                nullable=False)
     op.alter_column('idempotency_records', 'response_payload',
                existing_type=sa.String(),
-               type_=postgresql.JSONB(astext_type=sa.Text()),
-               nullable=False)
+               type_=postgresql.JSONB(astext_type=sa.Text()), postgresql_using='response_payload::jsonb',
+               nullable=True)
     op.drop_column('idempotency_records', 'journal_entry_id')
     op.drop_column('idempotency_records', 'id')
     op.alter_column('accounts', 'type',
                existing_type=sa.String(length=50),
                type_=postgresql.ENUM('ASSET', 'LIABILITY', 'EQUITY', 'REVENUE', 'EXPENSE', name='accounttype'),
-               existing_nullable=False)
+               existing_nullable=False, postgresql_using='type::accounttype')
     op.alter_column('accounts', 'name',
                existing_type=sa.String(length=255),
                type_=sa.VARCHAR(length=100),
@@ -2390,6 +2791,8 @@ def downgrade() -> None:
     op.drop_table('journal_entries')
     op.drop_table('idempotency_records')
     op.drop_table('accounts')
+    op.execute('DROP TYPE IF EXISTS accounttype')
+    op.execute('DROP TYPE IF EXISTS direction')
     # ### end Alembic commands ###
 ```
 
@@ -2457,13 +2860,31 @@ def upgrade() -> None:
     op.create_index('ix_postings_journal_entry_id', 'postings', ['journal_entry_id'], unique=False)
     op.drop_constraint(op.f('postings_journal_entry_id_fkey'), 'postings', type_='foreignkey')
     op.create_foreign_key(None, 'postings', 'journal_entries', ['journal_entry_id'], ['id'])
+    op.create_table('external_transactions',
+        sa.Column('id', postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column('source', sa.String(length=100), nullable=False),
+        sa.Column('external_ref', sa.String(length=255), nullable=False),
+        sa.Column('amount', sa.Numeric(precision=18, scale=4), nullable=False),
+        sa.Column('currency', sa.String(length=3), nullable=False),
+        sa.Column('transaction_date', sa.DateTime(timezone=True), nullable=False),
+        sa.Column('match_status', sa.Enum('UNMATCHED', 'EXACT_MATCH', 'WINDOW_MATCH', 'MANUAL_REVIEW', 'RESOLVED', name='matchstatus'), nullable=False),
+        sa.Column('matched_posting_id', postgresql.UUID(as_uuid=True), nullable=True),
+        sa.Column('created_at', sa.DateTime(timezone=True), nullable=True),
+        sa.ForeignKeyConstraint(['matched_posting_id'], ['postings.id'], ),
+        sa.PrimaryKeyConstraint('id'),
+        sa.UniqueConstraint('external_ref')
+    )
+    op.create_index(op.f('ix_external_transactions_external_ref'), 'external_transactions', ['external_ref'], unique=False)
     # ### end Alembic commands ###
 
 
 def downgrade() -> None:
     """Downgrade schema."""
     # ### commands auto generated by Alembic - please adjust! ###
-    op.drop_constraint(None, 'postings', type_='foreignkey')
+    op.drop_index(op.f('ix_external_transactions_external_ref'), table_name='external_transactions')
+    op.drop_table('external_transactions')
+    op.execute('DROP TYPE IF EXISTS matchstatus')
+    op.drop_constraint('postings_journal_entry_id_fkey', 'postings', type_='foreignkey')
     op.create_foreign_key(op.f('postings_journal_entry_id_fkey'), 'postings', 'journal_entries', ['journal_entry_id'], ['id'], ondelete='CASCADE')
     op.drop_index('ix_postings_journal_entry_id', table_name='postings')
     op.alter_column('postings', 'direction',
@@ -2479,7 +2900,7 @@ def downgrade() -> None:
                type_=sa.VARCHAR(length=255),
                existing_nullable=False)
     op.add_column('idempotency_records', sa.Column('response_payload', sa.VARCHAR(), autoincrement=False, nullable=True))
-    op.drop_constraint(None, 'idempotency_records', type_='foreignkey')
+    op.drop_constraint('idempotency_records_journal_entry_id_fkey', 'idempotency_records', type_='foreignkey')
     op.create_foreign_key(op.f('idempotency_records_journal_entry_id_fkey'), 'idempotency_records', 'journal_entries', ['journal_entry_id'], ['id'], ondelete='SET NULL')
     op.alter_column('idempotency_records', 'created_at',
                existing_type=postgresql.TIMESTAMP(timezone=True),

@@ -73,4 +73,6 @@ def downgrade() -> None:
     op.drop_table('journal_entries')
     op.drop_table('idempotency_records')
     op.drop_table('accounts')
+    op.execute('DROP TYPE IF EXISTS accounttype')
+    op.execute('DROP TYPE IF EXISTS direction')
     # ### end Alembic commands ###

@@ -1,6 +1,6 @@
 import uuid
 from decimal import Decimal
-from typing import Optional, Union, Tuple
+from typing import Optional, Union, Tuple, List
 from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -60,6 +60,32 @@ class LedgerService:
                 detail=f"Account '{account_id_or_name}' not found."
             )
         return account
+
+    async def _lock_accounts(self, account_ids: List[uuid.UUID]) -> dict:
+        """Acquire PostgreSQL row-level locks (SELECT ... FOR UPDATE) on the given
+        accounts, always in sorted-by-id order, to serialize concurrent journal
+        entries that touch the same account and to prevent deadlocks between
+        two entries that share overlapping account sets."""
+        unique_ids = sorted(set(account_ids))
+        if not unique_ids:
+            return {}
+
+        stmt = (
+            select(Account)
+            .where(Account.id.in_(unique_ids))
+            .order_by(Account.id)
+            .with_for_update()
+        )
+        result = await self.db.execute(stmt)
+        locked = {a.id: a for a in result.scalars().all()}
+
+        missing = set(unique_ids) - set(locked.keys())
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Account(s) not found: {', '.join(str(m) for m in missing)}"
+            )
+        return locked
 
     async def get_account_balance(
         self, account_id: Union[uuid.UUID, str]
@@ -127,10 +153,20 @@ class LedgerService:
                 if record:
                     return await self._get_entry_with_postings(record.journal_entry_id)
 
-            resolved_postings = []
+            # Resolve account references (id or name) to real account ids first,
+            # without holding a lock yet.
+            resolved_ids = []
             for posting_data in entry_data.postings:
                 account = await self._resolve_account(posting_data.account_id)
-                resolved_postings.append((account.id, posting_data))
+                resolved_ids.append(account.id)
+
+            # Now acquire row-level locks on every distinct account involved,
+            # always in sorted order, BEFORE writing any postings. This is what
+            # serializes two concurrent, DISTINCT journal entries that both touch
+            # the same account — the Redis lock above only protects against the
+            # same idempotency key being replayed, it does not serialize
+            # different requests hitting the same account.
+            locked_accounts = await self._lock_accounts(resolved_ids)
 
             journal_entry = JournalEntry(
                 description=entry_data.description
@@ -138,7 +174,7 @@ class LedgerService:
             self.db.add(journal_entry)
             await self.db.flush()
 
-            for account_id, posting_data in resolved_postings:
+            for account_id, posting_data in zip(resolved_ids, entry_data.postings):
                 posting = Posting(
                     journal_entry_id=journal_entry.id,
                     account_id=account_id,

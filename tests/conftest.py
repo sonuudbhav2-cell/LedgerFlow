@@ -1,64 +1,97 @@
-# tests/conftest.py
-
+import os
+import subprocess
+import pytest
 import asyncio
 from typing import AsyncGenerator
-import pytest
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.pool import NullPool
 from httpx import AsyncClient, ASGITransport
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
-# CHANGE 1: Import StaticPool instead of NullPool
-from sqlalchemy.pool import StaticPool
-from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.ext.compiler import compiles
-
-from app.db.session import Base, get_db
 from app.main import app
+from app.db.session import get_db
 
-# CHANGE 2: Explicitly import models so linters don't remove the import
-from app.models.ledger import Account, JournalEntry, Posting, IdempotencyRecord
-
-
-@compiles(JSONB, "sqlite")
-def compile_jsonb_sqlite(element, compiler, **kw):
-    return "JSON"
-
-
-TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
-
-# CHANGE 3: Use StaticPool so all sessions share the same in-memory database
-engine_test = create_async_engine(
-    TEST_DATABASE_URL,
-    connect_args={"check_same_thread": False},
-    poolclass=StaticPool, 
+# Real Postgres required — the balance-enforcement trigger is Postgres-only
+# and must actually be created by running migrations, not create_all().
+DATABASE_URL_TEST = os.environ.get(
+    "DATABASE_URL",
+    "postgresql+asyncpg://ledger_user:ledger_password@localhost:5432/ledgerflow_test",
 )
 
+# NullPool: forces a fresh connection every time instead of reusing a pooled
+# connection across pytest-asyncio's per-test event loops, which caused
+# "attached to a different loop" RuntimeErrors.
+engine_test_instance = create_async_engine(
+    DATABASE_URL_TEST, echo=False, future=True, poolclass=NullPool
+)
 async_session_test = async_sessionmaker(
-    engine_test, class_=AsyncSession, expire_on_commit=False
+    engine_test_instance, class_=AsyncSession, expire_on_commit=False
 )
 
 
-async def override_get_db() -> AsyncGenerator[AsyncSession, None]:
-    async with async_session_test() as session:
-        yield session
+def _run_alembic_upgrade():
+    subprocess.run(
+        ["alembic", "upgrade", "head"],
+        env={**os.environ, "DATABASE_URL": DATABASE_URL_TEST},
+        check=True,
+    )
 
 
-app.dependency_overrides[get_db] = override_get_db
+def _run_alembic_downgrade():
+    subprocess.run(
+        ["alembic", "downgrade", "base"],
+        env={**os.environ, "DATABASE_URL": DATABASE_URL_TEST},
+        check=True,
+    )
 
 
 @pytest.fixture(autouse=True)
 async def setup_database():
-    """Create tables before each test and drop them afterward."""
-    async with engine_test.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _run_alembic_upgrade)
     yield
-    async with engine_test.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
+    await loop.run_in_executor(None, _run_alembic_downgrade)
+
+
+@pytest.fixture(autouse=True)
+async def reset_redis_client():
+    """Disconnect the Redis client pool before/after tests to prevent event loop mismatch errors."""
+    try:
+        from app.db.redis import redis_client
+        if redis_client:
+            await redis_client.connection_pool.disconnect()
+    except (ImportError, AttributeError):
+        pass
+    yield
+    try:
+        from app.db.redis import redis_client
+        if redis_client:
+            await redis_client.connection_pool.disconnect()
+    except (ImportError, AttributeError):
+        pass
+
+
+@pytest.fixture
+async def async_session() -> AsyncGenerator[AsyncSession, None]:
+    async with async_session_test() as session:
+        yield session
 
 
 @pytest.fixture
 async def async_client() -> AsyncGenerator[AsyncClient, None]:
-    """Provide an asynchronous HTTP client for testing FastAPI endpoints."""
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as client:
+    # Each request gets its OWN session (not one shared session reused across
+    # concurrent requests) — AsyncSession is not safe for concurrent use.
+    async def override_get_db():
+        async with async_session_test() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         yield client
+
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def engine_test():
+    return engine_test_instance

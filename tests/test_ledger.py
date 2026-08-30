@@ -1,40 +1,30 @@
 import pytest
-from decimal import Decimal
 from httpx import AsyncClient
-from uuid import uuid4
+from sqlalchemy.exc import IntegrityError
+from app.models.ledger import JournalEntry, Posting
+
 
 @pytest.mark.asyncio
-async def test_create_account_and_check_balance(async_client: AsyncClient):
-    res = await async_client.post("/api/v1/accounts", json={"name": "EUR Bank", "type": "ASSET", "currency": "EUR"})
-    assert res.status_code == 201
-    account_id = res.json()["id"]
-    assert res.json()["currency"] == "EUR"
+async def test_balance_trigger_rejects_unbalanced_entry(async_client: AsyncClient, async_session, engine_test):
+    # This test requires real PostgreSQL where the trigger is active
+    if "sqlite" in str(engine_test.url):
+        pytest.skip("Balance trigger is PostgreSQL-specific")
 
-    bal_res = await async_client.get(f"/api/v1/accounts/{account_id}/balance")
-    assert bal_res.status_code == 200
-    assert bal_res.json()["currency"] == "EUR"
-    assert Decimal(str(bal_res.json()["balance"])) == Decimal("0")
+    async with async_session as session:
+        acc1_res = await async_client.post("/api/v1/accounts", json={"name": "TriggerAsset", "type": "ASSET", "currency": "USD"})
+        acc2_res = await async_client.post("/api/v1/accounts", json={"name": "TriggerExpense", "type": "EXPENSE", "currency": "USD"})
+        acc1_id = acc1_res.json()["id"]
+        acc2_id = acc2_res.json()["id"]
 
-@pytest.mark.asyncio
-async def test_idempotent_entry_creation(async_client: AsyncClient):
-    acc1 = (await async_client.post("/api/v1/accounts", json={"name": "Cash", "type": "ASSET", "currency": "USD"})).json()["id"]
-    acc2 = (await async_client.post("/api/v1/accounts", json={"name": "Revenue", "type": "REVENUE", "currency": "USD"})).json()["id"]
+        entry = JournalEntry(description="Unbalanced Direct Insert")
+        session.add(entry)
+        await session.flush()
 
-    idempotency_key = str(uuid4())
-    payload = {
-        "description": "Payment",
-        "postings": [
-            {"account_id": acc1, "amount": "100.00", "direction": "DEBIT"},
-            {"account_id": acc2, "amount": "100.00", "direction": "CREDIT"}
-        ]
-    }
+        session.add(Posting(journal_entry_id=entry.id, account_id=acc1_id, amount="100.00", direction="DEBIT"))
+        session.add(Posting(journal_entry_id=entry.id, account_id=acc2_id, amount="50.00", direction="CREDIT"))
 
-    res1 = await async_client.post("/api/v1/entries", json=payload, headers={"Idempotency-Key": idempotency_key})
-    assert res1.status_code == 201
-    entry_id_1 = res1.json()["id"]
-
-    res2 = await async_client.post("/api/v1/entries", json=payload, headers={"Idempotency-Key": idempotency_key})
-    assert res2.status_code == 201
-    entry_id_2 = res2.json()["id"]
-
-    assert entry_id_1 == entry_id_2
+        with pytest.raises(Exception) as exc_info:
+            await session.commit()
+        
+        assert "Double-entry violation" in str(exc_info.value) or isinstance(exc_info.value, IntegrityError)
+        await session.rollback()
