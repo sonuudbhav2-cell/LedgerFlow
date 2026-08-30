@@ -1,6 +1,6 @@
 from uuid import UUID
 from datetime import datetime
-from decimal import Decimal
+from typing import Optionalfrom decimal import Decimal
 from fastapi import APIRouter, Depends, Query, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_
